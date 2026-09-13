@@ -1,0 +1,89 @@
+# Production stack: self-contained images, no bind mounts, no Vite dev server.
+#   docker compose -f compose.prod.yaml up -d --build
+# The database is external, exactly like in development.
+name: ${COMPOSE_PROJECT_NAME:-laravel-app}
+
+x-php-service: &php-service
+  build:
+    context: .
+    dockerfile: docker/php/Dockerfile
+    target: prod
+    args:
+      PHP_VERSION: ${PHP_VERSION:-8.5}
+      NODE_VERSION: ${NODE_VERSION:-24}
+  image: ${COMPOSE_PROJECT_NAME:-laravel-app}/php:${APP_VERSION:-latest}
+  restart: unless-stopped
+  env_file: [.env]
+  environment:
+    APP_ENV: production
+    APP_DEBUG: "false"
+  volumes:
+    - storage:/var/www/html/storage
+  depends_on:
+    redis:
+      condition: service_healthy
+  networks: [app, db]
+
+services:
+  php:
+    <<: *php-service
+    environment:
+      APP_ENV: production
+      APP_DEBUG: "false"
+      RUN_MIGRATIONS: "true"
+
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+      target: prod
+      args:
+        NGINX_VERSION: ${NGINX_VERSION:-1.30}
+        NODE_VERSION: ${NODE_VERSION:-24}
+    image: ${COMPOSE_PROJECT_NAME:-laravel-app}/nginx:${APP_VERSION:-latest}
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-80}:80"
+    depends_on:
+      php:
+        condition: service_started
+    networks: [app]
+
+  queue:
+    <<: *php-service
+    command: php artisan queue:work --tries=3 --max-time=3600 --sleep=1
+    healthcheck:
+      disable: true   # workers do not listen on the fpm port
+    deploy:
+      replicas: 2
+
+  scheduler:
+    <<: *php-service
+    command: php artisan schedule:work
+    healthcheck:
+      disable: true   # workers do not listen on the fpm port
+
+  redis:
+    image: redis:${REDIS_VERSION:-8-alpine}
+    restart: unless-stopped
+    command: redis-server --appendonly yes --save 60 1
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [app]
+
+volumes:
+  redis-data:
+  storage:
+
+networks:
+  app:
+    driver: bridge
+
+  db:
+    external: true
+    name: ${DB_NETWORK:-databases_databases-network}

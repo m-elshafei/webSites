@@ -1,0 +1,157 @@
+# Local development stack.  Production lives in compose.prod.yaml.
+#   docker compose up -d
+#
+# The database is NOT part of this stack: the app joins the shared MySQL
+# container's network instead. Run `docker compose --profile local-db up -d`
+# if a project ever needs its own throwaway database.
+name: ${COMPOSE_PROJECT_NAME:-laravel-app}
+
+x-php-build: &php-build
+  context: .
+  dockerfile: docker/php/Dockerfile
+  target: dev
+  args:
+    PHP_VERSION: ${PHP_VERSION:-8.5}
+    UID: ${UID:-1000}
+    GID: ${GID:-1000}
+
+x-php-service: &php-service
+  build: *php-build
+  image: ${COMPOSE_PROJECT_NAME:-laravel-app}/php:dev
+  restart: unless-stopped
+  user: "${UID:-1000}:${GID:-1000}"
+  volumes:
+    - .:/var/www/html
+  environment:
+    APP_ENV: local
+    APP_DEBUG: "true"
+    XDEBUG_MODE: ${XDEBUG_MODE:-off}
+    PHP_IDE_CONFIG: serverName=docker
+  extra_hosts:
+    - "host.docker.internal:host-gateway"
+  depends_on:
+    redis:
+      condition: service_healthy
+  networks: [app, db]
+
+services:
+  php:
+    <<: *php-service
+    container_name: ${COMPOSE_PROJECT_NAME:-laravel-app}-php
+
+  nginx:
+    build:
+      context: .
+      dockerfile: docker/nginx/Dockerfile
+      target: dev
+      args:
+        NGINX_VERSION: ${NGINX_VERSION:-1.30}
+    image: ${COMPOSE_PROJECT_NAME:-laravel-app}/nginx:dev
+    container_name: ${COMPOSE_PROJECT_NAME:-laravel-app}-nginx
+    restart: unless-stopped
+    ports:
+      - "${APP_PORT:-8050}:80"
+    volumes:
+      - .:/var/www/html:ro
+    depends_on:
+      php:
+        condition: service_started
+    networks: [app]
+
+  node:
+    build:
+      context: .
+      dockerfile: docker/node/Dockerfile
+      args:
+        NODE_VERSION: ${NODE_VERSION:-24}
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: ${COMPOSE_PROJECT_NAME:-laravel-app}/node:dev
+    container_name: ${COMPOSE_PROJECT_NAME:-laravel-app}-vite
+    restart: unless-stopped
+    user: "${UID:-1000}:${GID:-1000}"
+    volumes:
+      - .:/var/www/html
+    ports:
+      # Fixed port; Vite runs with strictPort so it never drifts to 5174.
+      - "${VITE_PORT:-5173}:5173"
+    environment:
+      VITE_PORT: ${VITE_PORT:-5173}
+      VITE_DEV_HOST: ${VITE_DEV_HOST:-localhost}
+    networks: [app]
+
+  queue:
+    <<: *php-service
+    container_name: ${COMPOSE_PROJECT_NAME:-laravel-app}-queue
+    command: php artisan queue:listen --tries=1 --timeout=90
+    healthcheck:
+      disable: true   # workers do not listen on the fpm port
+
+  scheduler:
+    <<: *php-service
+    container_name: ${COMPOSE_PROJECT_NAME:-laravel-app}-scheduler
+    command: php artisan schedule:work
+    healthcheck:
+      disable: true   # workers do not listen on the fpm port
+
+  redis:
+    image: redis:${REDIS_VERSION:-8-alpine}
+    container_name: ${COMPOSE_PROJECT_NAME:-laravel-app}-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes --save 60 1
+    ports:
+      - "${FORWARD_REDIS_PORT:-63790}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 10
+    networks: [app]
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: ${COMPOSE_PROJECT_NAME:-laravel-app}-mail
+    restart: unless-stopped
+    ports:
+      - "${FORWARD_MAILPIT_PORT:-8025}:8025"
+    networks: [app]
+
+  # Opt-in throwaway database for projects that do not use the shared one:
+  #   docker compose --profile local-db up -d
+  mariadb:
+    image: mariadb:${MARIADB_VERSION:-11.8}
+    container_name: ${COMPOSE_PROJECT_NAME:-laravel-app}-db
+    profiles: [local-db]
+    restart: unless-stopped
+    ports:
+      - "${FORWARD_DB_PORT:-33060}:3306"
+    environment:
+      MARIADB_DATABASE: ${DB_DATABASE:-laravel}
+      MARIADB_USER: ${DB_USERNAME:-laravel}
+      MARIADB_PASSWORD: ${DB_PASSWORD:-secret}
+      MARIADB_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-secret}
+      MARIADB_AUTO_UPGRADE: "1"
+    volumes:
+      - db-data:/var/lib/mysql
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    networks: [app]
+
+volumes:
+  redis-data:
+  db-data:
+
+networks:
+  app:
+    driver: bridge
+
+  # Created by the separate database stack, not by this project.
+  db:
+    external: true
+    name: ${DB_NETWORK:-databases_databases-network}
